@@ -6,7 +6,7 @@ import asyncio
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 def _install_module(name: str, *, package: bool = False, **attributes: object) -> None:
@@ -79,6 +79,7 @@ _install_module(
 )
 
 from custom_components.uplift_desk import async_unload_entry
+import custom_components.uplift_desk.coordinator as coordinator_module
 from custom_components.uplift_desk.coordinator import UpliftDeskBluetoothCoordinator
 
 
@@ -89,7 +90,14 @@ def _coordinator(controller: object | None = None) -> UpliftDeskBluetoothCoordin
     coordinator._discovered_desk = SimpleNamespace(
         name="Test Desk", address="00:11:22:33:44:55"
     )
+    coordinator._desk_ble_device = SimpleNamespace(
+        name="Test Desk", address="00:11:22:33:44:55"
+    )
     coordinator._desk = controller
+    coordinator._desk_lock = asyncio.Lock()
+    coordinator._disconnecting = False
+    coordinator._validated_desk = None
+    coordinator._desk_variant = None
     coordinator._get_desk_controller = AsyncMock()
     return coordinator
 
@@ -249,4 +257,192 @@ class CoordinatorDisconnectTests(IsolatedAsyncioTestCase):
         await coordinator.async_connect()
 
         coordinator._get_desk_controller.assert_awaited_once()
-        controller.start.assert_awaited_once()
+        controller.start.assert_not_awaited()
+
+
+class CoordinatorReconnectTests(IsolatedAsyncioTestCase):
+    def _reconnect_coordinator(
+        self, *, controller: object | None = None, validated_desk: object | None = None
+    ) -> UpliftDeskBluetoothCoordinator:
+        coordinator = _coordinator(controller)
+        del coordinator._get_desk_controller
+        coordinator._validated_desk = validated_desk
+        return coordinator
+
+    async def test_initial_connect_validates_and_starts_notifications(self) -> None:
+        validation_client = object()
+        new_client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+        new_controller = _controller(client=new_client)
+        new_controller.start = AsyncMock()
+        new_controller.on = MagicMock()
+        desk_variant = object()
+        validated_desk = SimpleNamespace(
+            desk_config=SimpleNamespace(desk_variant=desk_variant),
+            create_controller=MagicMock(return_value=new_controller),
+        )
+        validator = SimpleNamespace(
+            validate_device=AsyncMock(return_value=validated_desk)
+        )
+        coordinator = self._reconnect_coordinator()
+
+        with (
+            patch.object(
+                coordinator_module,
+                "DeskValidator",
+                MagicMock(return_value=validator),
+            ),
+            patch.object(
+                coordinator_module,
+                "establish_connection",
+                AsyncMock(side_effect=[validation_client, new_client]),
+            ) as establish,
+        ):
+            result = await coordinator._get_desk_controller()
+
+        self.assertIs(result, new_controller)
+        new_controller.start.assert_awaited_once()
+        self.assertIs(coordinator._validated_desk, validated_desk)
+        self.assertIs(coordinator._desk_variant, desk_variant)
+        validator.validate_device.assert_awaited_once()
+        self.assertEqual(establish.await_count, 2)
+
+    async def test_reconnect_disposes_stale_controller_and_starts_notifications(
+        self,
+    ) -> None:
+        stale_client = _client()
+        stale_controller = _controller(client=stale_client)
+        new_client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+        new_controller = _controller(client=new_client)
+        new_controller.start = AsyncMock()
+        new_controller.on = MagicMock()
+        validated_desk = SimpleNamespace(
+            desk_config=SimpleNamespace(desk_variant=object()),
+            create_controller=MagicMock(return_value=new_controller),
+        )
+        coordinator = self._reconnect_coordinator(
+            controller=stale_controller, validated_desk=validated_desk
+        )
+
+        with patch.object(
+            coordinator_module,
+            "establish_connection",
+            AsyncMock(return_value=new_client),
+        ) as establish:
+            result = await coordinator._get_desk_controller()
+
+        self.assertIs(result, new_controller)
+        self.assertIs(coordinator._desk, new_controller)
+        stale_controller.stop.assert_awaited_once()
+        stale_client.disconnect.assert_awaited_once()
+        new_controller.on.assert_called_once()
+        new_controller.start.assert_awaited_once()
+        establish.assert_awaited_once()
+
+    async def test_concurrent_reconnect_calls_share_one_controller(self) -> None:
+        connection_started = asyncio.Event()
+        release_connection = asyncio.Event()
+        new_client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+        new_controller = _controller(client=new_client)
+        new_controller.start = AsyncMock()
+        new_controller.on = MagicMock()
+        validated_desk = SimpleNamespace(
+            desk_config=SimpleNamespace(desk_variant=object()),
+            create_controller=MagicMock(return_value=new_controller),
+        )
+        coordinator = self._reconnect_coordinator(validated_desk=validated_desk)
+
+        async def establish(*args: object, **kwargs: object) -> object:
+            connection_started.set()
+            await release_connection.wait()
+            return new_client
+
+        with patch.object(
+            coordinator_module,
+            "establish_connection",
+            AsyncMock(side_effect=establish),
+        ) as establish_mock:
+            first = asyncio.create_task(coordinator._get_desk_controller())
+            await connection_started.wait()
+            second = asyncio.create_task(coordinator._get_desk_controller())
+            release_connection.set()
+            first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertIs(first_result, new_controller)
+        self.assertIs(second_result, new_controller)
+        establish_mock.assert_awaited_once()
+        validated_desk.create_controller.assert_called_once()
+        new_controller.start.assert_awaited_once()
+
+    async def test_failed_notification_start_cleans_up_new_controller(self) -> None:
+        new_client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+        new_controller = _controller(client=new_client)
+        new_controller.start = AsyncMock(side_effect=RuntimeError("start failed"))
+        new_controller.on = MagicMock()
+        validated_desk = SimpleNamespace(
+            desk_config=SimpleNamespace(desk_variant=object()),
+            create_controller=MagicMock(return_value=new_controller),
+        )
+        coordinator = self._reconnect_coordinator(validated_desk=validated_desk)
+
+        with patch.object(
+            coordinator_module,
+            "establish_connection",
+            AsyncMock(return_value=new_client),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "start failed"):
+                await coordinator._get_desk_controller()
+
+        self.assertIsNone(coordinator._desk)
+        new_controller.stop.assert_awaited_once()
+        new_client.disconnect.assert_awaited_once()
+        self.assertIsNone(new_controller.client)
+
+    async def test_unload_suppresses_in_flight_reconnect(self) -> None:
+        connection_started = asyncio.Event()
+        release_connection = asyncio.Event()
+        new_client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+        new_controller = _controller(client=new_client)
+        new_controller.start = AsyncMock()
+        new_controller.on = MagicMock()
+        validated_desk = SimpleNamespace(
+            desk_config=SimpleNamespace(desk_variant=object()),
+            create_controller=MagicMock(return_value=new_controller),
+        )
+        coordinator = self._reconnect_coordinator(validated_desk=validated_desk)
+
+        async def establish(*args: object, **kwargs: object) -> object:
+            connection_started.set()
+            await release_connection.wait()
+            return new_client
+
+        with patch.object(
+            coordinator_module,
+            "establish_connection",
+            AsyncMock(side_effect=establish),
+        ):
+            reconnect = asyncio.create_task(coordinator._get_desk_controller())
+            await connection_started.wait()
+            unload = asyncio.create_task(coordinator.async_disconnect())
+            await asyncio.sleep(0)
+            self.assertTrue(coordinator._disconnecting)
+            release_connection.set()
+            with self.assertRaisesRegex(RuntimeError, "disconnecting"):
+                await reconnect
+            await unload
+
+        self.assertIsNone(coordinator._desk)
+        new_controller.start.assert_not_awaited()
+        new_controller.stop.assert_awaited_once()
+        new_client.disconnect.assert_awaited_once()
+
+    async def test_unload_state_rejects_new_reconnect(self) -> None:
+        coordinator = self._reconnect_coordinator()
+        coordinator._disconnecting = True
+
+        with patch.object(
+            coordinator_module, "establish_connection", AsyncMock()
+        ) as establish:
+            with self.assertRaisesRegex(RuntimeError, "disconnecting"):
+                await coordinator._get_desk_controller()
+
+        establish.assert_not_awaited()
