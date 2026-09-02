@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from enum import Enum
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
@@ -22,13 +23,45 @@ class _DataUpdateCoordinator:
     pass
 
 
+class _FlowBase:
+    def async_create_entry(self, *, title: str = "", data: dict[str, object]):
+        return {"type": "create_entry", "title": title, "data": data}
+
+    def async_show_form(self, *, step_id: str, data_schema=None, **kwargs: object):
+        return {
+            "type": "form",
+            "step_id": step_id,
+            "data_schema": data_schema,
+            **kwargs,
+        }
+
+
+class _ConfigFlow(_FlowBase):
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__()
+
+
+class _DeskUnit(Enum):
+    CENTIMETERS = "centimeters"
+    INCHES = "inches"
+
+
+class _Invalid(Exception):
+    pass
+
+
+class _Schema:
+    def __init__(self, schema: object) -> None:
+        self.schema = schema
+
+
 _platform = SimpleNamespace(SENSOR="sensor", BUTTON="button")
 _core_state = SimpleNamespace(running=object())
 _desk_variant = SimpleNamespace(
     JIECANG_0x00FF=object(), JIECANG_0xFE60=object()
 )
 _desk_event_type = SimpleNamespace(HEIGHT=object())
-_desk_unit = SimpleNamespace(CENTIMETERS=object())
+_desk_unit = _DeskUnit
 
 _install_module("uplift_ble", package=True)
 _install_module("uplift_ble.desk_controller", DeskController=object)
@@ -56,10 +89,19 @@ _install_module(
 _install_module("homeassistant", package=True)
 _install_module("homeassistant.components", package=True)
 _install_module("homeassistant.helpers", package=True)
-_install_module("homeassistant.config_entries", ConfigEntry=object)
+_install_module(
+    "homeassistant.config_entries",
+    ConfigEntry=object,
+    ConfigFlow=_ConfigFlow,
+    ConfigFlowResult=dict,
+    OptionsFlow=_FlowBase,
+)
 _install_module("homeassistant.const", CONF_ADDRESS="address", Platform=_platform)
 _install_module(
-    "homeassistant.core", CoreState=_core_state, HomeAssistant=object
+    "homeassistant.core",
+    CoreState=_core_state,
+    HomeAssistant=object,
+    callback=lambda function: function,
 )
 _install_module("homeassistant.exceptions", ConfigEntryNotReady=Exception)
 _install_module(
@@ -74,13 +116,41 @@ _install_module(
 _install_module(
     "homeassistant.components.bluetooth",
     async_ble_device_from_address=MagicMock(),
+    async_discovered_service_info=MagicMock(return_value=[]),
     BluetoothScanningMode=object,
     BluetoothServiceInfoBleak=object,
 )
+_install_module(
+    "homeassistant.helpers.selector",
+    SelectSelector=lambda config: config,
+    SelectSelectorConfig=lambda **kwargs: kwargs,
+    SelectSelectorMode=SimpleNamespace(DROPDOWN="dropdown"),
+    selector=lambda config: config,
+)
+_install_module(
+    "voluptuous",
+    Invalid=_Invalid,
+    Optional=lambda key, default=None: key,
+    Required=lambda key, default=None: key,
+    Schema=_Schema,
+)
 
-from custom_components.uplift_desk import async_unload_entry
+import custom_components.uplift_desk as integration_module
+from custom_components.uplift_desk import (
+    async_migrate_entry,
+    async_reload_entry,
+    async_unload_entry,
+)
+from custom_components.uplift_desk.config_flow import (
+    UpliftDeskConfigFlow,
+    UpliftDeskOptionsFlow,
+)
+from custom_components.uplift_desk.const import CONF_FALLBACK_UNIT, FALLBACK_UNIT_NONE
 import custom_components.uplift_desk.coordinator as coordinator_module
-from custom_components.uplift_desk.coordinator import UpliftDeskBluetoothCoordinator
+from custom_components.uplift_desk.coordinator import (
+    UpliftDeskBluetoothCoordinator,
+    _parse_fallback_unit,
+)
 
 
 def _coordinator(controller: object | None = None) -> UpliftDeskBluetoothCoordinator:
@@ -98,6 +168,7 @@ def _coordinator(controller: object | None = None) -> UpliftDeskBluetoothCoordin
     coordinator._disconnecting = False
     coordinator._validated_desk = None
     coordinator._desk_variant = None
+    coordinator._fallback_unit = None
     coordinator._get_desk_controller = AsyncMock()
     return coordinator
 
@@ -113,6 +184,110 @@ def _client(*, disconnect: AsyncMock | None = None) -> SimpleNamespace:
 
 
 class UnloadEntryTests(IsolatedAsyncioTestCase):
+    async def test_setup_registers_options_reload_listener(self) -> None:
+        unsubscribe = object()
+        coordinator = SimpleNamespace(
+            desk_info="Test Desk",
+            _desk=object(),
+            async_connect=AsyncMock(),
+            async_read_desk_units=AsyncMock(),
+            async_read_desk_height=AsyncMock(),
+            async_set_updated_data=MagicMock(),
+        )
+        add_update_listener = MagicMock(return_value=unsubscribe)
+        async_on_unload = MagicMock()
+        entry = SimpleNamespace(
+            data={"address": "00:11:22:33:44:55"},
+            title="Test Desk",
+            add_update_listener=add_update_listener,
+            async_on_unload=async_on_unload,
+        )
+        hass = SimpleNamespace(
+            config_entries=SimpleNamespace(
+                async_forward_entry_setups=AsyncMock()
+            )
+        )
+
+        with (
+            patch.object(
+                integration_module,
+                "async_ble_device_from_address",
+                MagicMock(return_value=object()),
+            ),
+            patch.object(
+                integration_module,
+                "UpliftDeskBluetoothCoordinator",
+                MagicMock(return_value=coordinator),
+            ),
+        ):
+            result = await integration_module.async_setup_entry(hass, entry)
+
+        self.assertTrue(result)
+        add_update_listener.assert_called_once_with(async_reload_entry)
+        async_on_unload.assert_called_once_with(unsubscribe)
+
+    async def test_migration_preserves_legacy_centimeters_behavior(self) -> None:
+        update_entry = MagicMock()
+        hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_update_entry=update_entry)
+        )
+        entry = SimpleNamespace(
+            version=1,
+            minor_version=1,
+            options={},
+        )
+
+        result = await async_migrate_entry(hass, entry)
+
+        self.assertTrue(result)
+        update_entry.assert_called_once_with(
+            entry,
+            options={CONF_FALLBACK_UNIT: _desk_unit.CENTIMETERS.value},
+            minor_version=2,
+        )
+
+    async def test_migration_preserves_existing_fallback_option(self) -> None:
+        update_entry = MagicMock()
+        hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_update_entry=update_entry)
+        )
+        entry = SimpleNamespace(
+            version=1,
+            minor_version=1,
+            options={CONF_FALLBACK_UNIT: _desk_unit.INCHES.value},
+        )
+
+        await async_migrate_entry(hass, entry)
+
+        update_entry.assert_called_once_with(
+            entry,
+            options={CONF_FALLBACK_UNIT: _desk_unit.INCHES.value},
+            minor_version=2,
+        )
+
+    async def test_current_entry_does_not_migrate_again(self) -> None:
+        update_entry = MagicMock()
+        hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_update_entry=update_entry)
+        )
+        entry = SimpleNamespace(version=1, minor_version=2, options={})
+
+        result = await async_migrate_entry(hass, entry)
+
+        self.assertTrue(result)
+        update_entry.assert_not_called()
+
+    async def test_reload_entry_reloads_config_entry(self) -> None:
+        reload_entry = AsyncMock()
+        hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_reload=reload_entry)
+        )
+        entry = SimpleNamespace(entry_id="test-entry")
+
+        await async_reload_entry(hass, entry)
+
+        reload_entry.assert_awaited_once_with("test-entry")
+
     async def test_unloads_platforms_before_disconnecting(self) -> None:
         events: list[str] = []
 
@@ -305,6 +480,32 @@ class CoordinatorReconnectTests(IsolatedAsyncioTestCase):
         self.assertIs(coordinator._desk_variant, desk_variant)
         validator.validate_device.assert_awaited_once()
         self.assertEqual(establish.await_count, 2)
+        validated_desk.create_controller.assert_called_once_with(
+            new_client, fallback_unit=None
+        )
+
+    async def test_controller_receives_configured_fallback_unit(self) -> None:
+        new_client = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+        new_controller = _controller(client=new_client)
+        new_controller.start = AsyncMock()
+        new_controller.on = MagicMock()
+        validated_desk = SimpleNamespace(
+            desk_config=SimpleNamespace(desk_variant=object()),
+            create_controller=MagicMock(return_value=new_controller),
+        )
+        coordinator = self._reconnect_coordinator(validated_desk=validated_desk)
+        coordinator._fallback_unit = _desk_unit.INCHES
+
+        with patch.object(
+            coordinator_module,
+            "establish_connection",
+            AsyncMock(return_value=new_client),
+        ):
+            await coordinator._get_desk_controller()
+
+        validated_desk.create_controller.assert_called_once_with(
+            new_client, fallback_unit=_desk_unit.INCHES
+        )
 
     async def test_reconnect_disposes_stale_controller_and_starts_notifications(
         self,
@@ -446,3 +647,85 @@ class CoordinatorReconnectTests(IsolatedAsyncioTestCase):
                 await coordinator._get_desk_controller()
 
         establish.assert_not_awaited()
+
+
+class CoordinatorFallbackUnitTests(IsolatedAsyncioTestCase):
+    def test_parse_fallback_unit(self) -> None:
+        self.assertIsNone(_parse_fallback_unit(None))
+        self.assertIsNone(_parse_fallback_unit(FALLBACK_UNIT_NONE))
+        self.assertIsNone(_parse_fallback_unit("invalid"))
+        self.assertIs(
+            _parse_fallback_unit(_desk_unit.CENTIMETERS.value),
+            _desk_unit.CENTIMETERS,
+        )
+        self.assertIs(
+            _parse_fallback_unit(_desk_unit.INCHES.value), _desk_unit.INCHES
+        )
+
+    async def test_missing_reported_unit_uses_configured_fallback(self) -> None:
+        controller = SimpleNamespace(unit=None, request_units=AsyncMock())
+        coordinator = _coordinator()
+        coordinator._fallback_unit = _desk_unit.INCHES
+        coordinator._get_desk_controller = AsyncMock(return_value=controller)
+
+        result = await coordinator.async_read_desk_units()
+
+        self.assertIs(result, _desk_unit.INCHES)
+        self.assertFalse(hasattr(controller, "_unit"))
+
+    async def test_missing_reported_unit_without_fallback_stays_unknown(self) -> None:
+        controller = SimpleNamespace(unit=None, request_units=AsyncMock())
+        coordinator = _coordinator()
+        coordinator._get_desk_controller = AsyncMock(return_value=controller)
+
+        result = await coordinator.async_read_desk_units()
+
+        self.assertIsNone(result)
+        self.assertFalse(hasattr(controller, "_unit"))
+
+
+class OptionsFlowTests(IsolatedAsyncioTestCase):
+    def test_config_flow_registers_options_flow(self) -> None:
+        entry = SimpleNamespace(options={})
+
+        flow = UpliftDeskConfigFlow.async_get_options_flow(entry)
+
+        self.assertIsInstance(flow, UpliftDeskOptionsFlow)
+        self.assertIs(flow._config_entry, entry)
+
+    async def test_options_flow_shows_current_fallback(self) -> None:
+        flow = UpliftDeskOptionsFlow(
+            SimpleNamespace(options={CONF_FALLBACK_UNIT: _desk_unit.INCHES.value})
+        )
+
+        result = await flow.async_step_init()
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["step_id"], "init")
+
+    async def test_options_flow_saves_fallback(self) -> None:
+        flow = UpliftDeskOptionsFlow(SimpleNamespace(options={}))
+
+        result = await flow.async_step_init(
+            {CONF_FALLBACK_UNIT: _desk_unit.CENTIMETERS.value}
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "type": "create_entry",
+                "title": "",
+                "data": {CONF_FALLBACK_UNIT: _desk_unit.CENTIMETERS.value},
+            },
+        )
+
+    async def test_options_flow_saves_explicit_no_fallback(self) -> None:
+        flow = UpliftDeskOptionsFlow(SimpleNamespace(options={}))
+
+        result = await flow.async_step_init(
+            {CONF_FALLBACK_UNIT: FALLBACK_UNIT_NONE}
+        )
+
+        self.assertEqual(
+            result["data"], {CONF_FALLBACK_UNIT: FALLBACK_UNIT_NONE}
+        )

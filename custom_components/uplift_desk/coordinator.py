@@ -6,41 +6,35 @@ import asyncio
 from collections.abc import Callable
 import logging
 
-from uplift_ble.desk_controller import DeskController
-from uplift_ble.desk_configs import DeskVariant
-from uplift_ble.desk_validator import DeskValidator
-from uplift_ble.models import DiscoveredDesk as ValidatedDesk
-from uplift_ble.desk_enums import (
-    DeskEventType,
-    DeskUnit,
-)
-from uplift_ble.ble_protos import (
-    BLEClientProtocol,
-    BLEDeviceProtocol
-)
-
-from homeassistant.components.bluetooth import (
-    BluetoothScanningMode,
-    BluetoothServiceInfoBleak,
-)
-
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
-
-from homeassistant.core import CoreState, HomeAssistant
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
-from .const import DOMAIN, BLEAK_TIMEOUT_SECONDS
+from uplift_ble.ble_protos import BLEClientProtocol, BLEDeviceProtocol
+from uplift_ble.desk_configs import DeskVariant
+from uplift_ble.desk_controller import DeskController
+from uplift_ble.desk_enums import (
+    DeskEventType,
+    DeskUnit,
+)
+from uplift_ble.desk_validator import DeskValidator
+from uplift_ble.models import DiscoveredDesk as ValidatedDesk
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.update_coordinator import (
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
+
+from .const import (
+    BLEAK_TIMEOUT_SECONDS,
+    CONF_FALLBACK_UNIT,
+    FALLBACK_UNIT_NONE,
+)
 from .models import DiscoveredDesk
 
-type Uplift_Desk_DeskConfigEntry = ConfigEntry[UpliftDeskBluetoothCoordinator]  # noqa: F821
+type Uplift_Desk_DeskConfigEntry = ConfigEntry[UpliftDeskBluetoothCoordinator]
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -49,42 +43,28 @@ _EXTENDED_PRESET_VARIANTS = {
     DeskVariant.JIECANG_0xFE60,
 }
 
-def process_service_info(
-    hass: HomeAssistant,
-    entry: Uplift_Desk_DeskConfigEntry,
-    service_info: BluetoothServiceInfoBleak,
-) -> SensorUpdate:
-    """Process a BluetoothServiceInfoBleak, running side effects and returning sensor data."""
-    coordinator = entry.runtime_data
-    data = coordinator.device_data
-    update = data.update(service_info)
-    if not coordinator.model_info and (device_type := data.device_type):
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_DEVICE_TYPE: device_type}
-        )
-        coordinator.set_model_info(device_type)
-    if update.events and hass.state is CoreState.running:
-        # Do not fire events on data restore
-        address = service_info.device.address
-        for event in update.events.values():
-            key = event.device_key.key
-            signal = format_event_dispatcher_name(address, key)
-            async_dispatcher_send(hass, signal)
 
-    return update
+def _parse_fallback_unit(value: str | None) -> DeskUnit | None:
+    """Parse a configured fallback unit."""
+    if not value or value == FALLBACK_UNIT_NONE:
+        return None
+    try:
+        return DeskUnit(value)
+    except ValueError:
+        _LOGGER.warning("Ignoring invalid fallback unit: %s", value)
+        return None
 
 
-def format_event_dispatcher_name(address: str, key: str) -> str:
-    """Format an event dispatcher name."""
-    return f"{DOMAIN}_{address}_{key}"
-
-def _generate_existing_client_factory(bleak_client: BleakClient) -> Callable[..., BLEClientProtocol]:
+def _generate_existing_client_factory(
+    bleak_client: BleakClient,
+) -> Callable[..., BLEClientProtocol]:
     def _existing_client_factory(
         device: BLEDeviceProtocol, timeout: float
     ) -> BLEClientProtocol:
         return bleak_client
 
     return _existing_client_factory
+
 
 class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
     """Define the Update Coordinator."""
@@ -93,19 +73,29 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         self,
         hass: HomeAssistant,
         config_entry: Uplift_Desk_DeskConfigEntry,
-        desk_ble_device: BLEDevice
+        desk_ble_device: BLEDevice,
     ) -> None:
         """Initialize the Data Coordinator."""
         super().__init__(hass, _LOGGER, name="Uplift Desk", config_entry=config_entry)
-        _LOGGER.debug("Initializing coordinator for desk %s:%s with config entry %s", config_entry.title, desk_ble_device.address, config_entry)
+        _LOGGER.debug(
+            "Initializing coordinator for desk %s:%s with config entry %s",
+            config_entry.title,
+            desk_ble_device.address,
+            config_entry,
+        )
 
-        self._discovered_desk = DiscoveredDesk(name=config_entry.title, address=desk_ble_device.address)
+        self._discovered_desk = DiscoveredDesk(
+            name=config_entry.title, address=desk_ble_device.address
+        )
         self._desk_ble_device = desk_ble_device
         self._desk = None
         self._desk_lock = asyncio.Lock()
         self._disconnecting = False
         self._validated_desk: ValidatedDesk | None = None
         self._desk_variant: DeskVariant | None = None
+        self._fallback_unit = _parse_fallback_unit(
+            config_entry.options.get(CONF_FALLBACK_UNIT)
+        )
 
     async def _async_dispose_controller(self, controller: DeskController) -> None:
         client = getattr(controller, "client", None)
@@ -181,7 +171,9 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
                 self._desk_ble_device.name or self.desk_name or "Unknown",
                 max_attempts=3,
             )
-            controller = validated_desk.create_controller(bleak_client)
+            controller = validated_desk.create_controller(
+                bleak_client, fallback_unit=self._fallback_unit
+            )
             controller.on(DeskEventType.HEIGHT, self._async_height_notify_callback)
             if self._disconnecting:
                 await self._async_dispose_controller(controller)
@@ -240,9 +232,18 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         await controller.request_units()
         retrieved_unit = controller.unit
         if retrieved_unit is None:
-            _LOGGER.warning("Could not retrieve units from desk, defaulting to centimeters")
-            retrieved_unit = DeskUnit.CENTIMETERS
-            controller._unit = DeskUnit.CENTIMETERS
+            retrieved_unit = self._fallback_unit
+            if retrieved_unit is None:
+                _LOGGER.warning(
+                    "Desk %s did not report units and has no fallback configured",
+                    self.desk_info,
+                )
+            else:
+                _LOGGER.warning(
+                    "Desk %s did not report units, using configured %s fallback",
+                    self.desk_info,
+                    retrieved_unit.value,
+                )
         self.keypad_display_units = retrieved_unit
         return self.keypad_display_units
 
