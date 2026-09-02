@@ -84,6 +84,17 @@ This is the easiest way to install HASS Uplift Desk. Click the button below to g
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Bennett-Wendorf&repository=hass-uplift-desk&category=integration)
 
+### Fallback Height Unit
+
+Most desks report the unit associated with each height value. If a desk does
+not, open the integration's configuration options and select a fallback of
+centimeters or inches. The fallback is used only for height values that arrive
+without a reported unit; choose no fallback to leave those values unknown
+instead of guessing.
+
+Existing entries retain the previous centimeters behavior during upgrade. If
+the desk keypad displays inches, change the fallback option after upgrading.
+
 
 <!-- CONTRIBUTING -->
 ## Contributing

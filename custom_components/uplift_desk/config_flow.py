@@ -1,33 +1,54 @@
 """Config flow for the Uplift Desk integration."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 import logging
-
-from uplift_ble.desk_controller import DeskController
-from uplift_ble.desk_validator import DeskValidator
-
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from .const import DOMAIN, BLEAK_TIMEOUT_SECONDS
-from .models import DiscoveredDesk
-
+import re
 from typing import Any
+
+import voluptuous as vol
+
+from uplift_ble.desk_enums import DeskUnit
+from uplift_ble.desk_validator import DeskValidator
 
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+    selector,
+)
 
-import re
-import voluptuous as vol
-
-from homeassistant.helpers.selector import selector
-from dataclasses import dataclass
+from .const import (
+    BLEAK_TIMEOUT_SECONDS,
+    CONF_FALLBACK_UNIT,
+    DOMAIN,
+    FALLBACK_UNIT_NONE,
+)
+from .models import DiscoveredDesk
 
 logger = logging.getLogger(__name__)
+
+
 @dataclass
 class _ManualBLEDevice:
     """BLEDeviceProtocol-compatible stub for manual entry."""
+
     address: str
     name: str | None = None
+
+
 def _validate_mac_address(value: str) -> str:
     """Validate a MAC address string.
 
@@ -48,12 +69,14 @@ def _validate_mac_address(value: str) -> str:
         return ":".join(value[i : i + 2] for i in range(0, 12, 2))
 
     raise vol.Invalid(f"invalid mac address: {value}")
+
+
 class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
     """Uplift Desk config flow."""
     # The schema version of the entries that it creates
     # Home Assistant will call your migrate method if the version changes
     VERSION = 1
-    MINOR_VERSION = 1
+    MINOR_VERSION = 2
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -64,6 +87,14 @@ class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
         ] = {}
         self._manual_address: str | None = None
         self._manual_name: str | None = None
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> UpliftDeskOptionsFlow:
+        """Return the options flow handler."""
+        return UpliftDeskOptionsFlow(config_entry)
 
     async def async_step_bluetooth(self, discovery_info: BluetoothServiceInfoBleak) -> ConfigFlowResult:
         """Handle a flow initialized by Bluetooth discovery."""
@@ -338,4 +369,43 @@ class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user_confirm",
             description_placeholders=placeholders,
+        )
+
+
+class UpliftDeskOptionsFlow(OptionsFlow):
+    """Handle Uplift Desk options."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Initialize the options flow."""
+        self._config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the fallback height unit."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current_unit = self._config_entry.options.get(
+            CONF_FALLBACK_UNIT, FALLBACK_UNIT_NONE
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_FALLBACK_UNIT, default=current_unit
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                FALLBACK_UNIT_NONE,
+                                DeskUnit.CENTIMETERS.value,
+                                DeskUnit.INCHES.value,
+                            ],
+                            mode=SelectSelectorMode.DROPDOWN,
+                            translation_key="fallback_unit",
+                        )
+                    )
+                }
+            ),
         )
