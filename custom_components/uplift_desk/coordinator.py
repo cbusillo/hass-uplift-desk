@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import logging
-import asyncio
 
 from uplift_ble.desk_controller import DeskController
 from uplift_ble.desk_configs import DeskVariant
@@ -23,8 +23,6 @@ from homeassistant.components.bluetooth import (
     BluetoothScanningMode,
     BluetoothServiceInfoBleak,
 )
-
-from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
 
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -104,33 +102,100 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         self._discovered_desk = DiscoveredDesk(name=config_entry.title, address=desk_ble_device.address)
         self._desk_ble_device = desk_ble_device
         self._desk = None
+        self._desk_lock = asyncio.Lock()
+        self._disconnecting = False
+        self._validated_desk: ValidatedDesk | None = None
         self._desk_variant: DeskVariant | None = None
 
-    async def _get_desk_controller(self):
+    async def _async_dispose_controller(self, controller: DeskController) -> None:
+        client = getattr(controller, "client", None)
+        try:
+            await controller.stop()
+        except Exception:
+            _LOGGER.debug(
+                "Error stopping desk controller for %s",
+                self.desk_info,
+                exc_info=True,
+            )
+        finally:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    _LOGGER.debug(
+                        "Error disconnecting BLE client for %s",
+                        self.desk_info,
+                        exc_info=True,
+                    )
+                finally:
+                    if getattr(controller, "client", None) is client:
+                        controller.client = None
+
+    async def _get_desk_controller(self) -> DeskController:
         _LOGGER.debug("Getting desk controller for %s", self.desk_info)
-        if self._desk is None or not self.is_connected:
+        if self._disconnecting:
+            raise RuntimeError("Desk coordinator is disconnecting")
+        if self.is_connected:
+            return self._desk
+
+        async with self._desk_lock:
+            if self._disconnecting:
+                raise RuntimeError("Desk coordinator is disconnecting")
+            if self.is_connected:
+                return self._desk
+
+            stale_controller = self._desk
+            self._desk = None
+            if stale_controller is not None:
+                await self._async_dispose_controller(stale_controller)
+
+            validated_desk = self._validated_desk
+            if validated_desk is None:
+                bleak_client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    self._desk_ble_device,
+                    self._desk_ble_device.name or self.desk_name or "Unknown",
+                    max_attempts=3,
+                )
+
+                bleak_client_factory: Callable[..., BLEClientProtocol] = (
+                    _generate_existing_client_factory(bleak_client)
+                )
+
+                validated_desk = await DeskValidator(
+                    bleak_client_factory
+                ).validate_device(
+                    self._discovered_desk, timeout=BLEAK_TIMEOUT_SECONDS
+                )
+                if validated_desk is None:
+                    raise UpdateFailed(f"Could not validate desk {self.desk_info}")
+                self._validated_desk = validated_desk
+                self._desk_variant = validated_desk.desk_config.desk_variant
+
+            if self._disconnecting:
+                raise RuntimeError("Desk coordinator is disconnecting")
+
             bleak_client = await establish_connection(
                 BleakClientWithServiceCache,
-                self._desk_ble_device, 
+                self._desk_ble_device,
                 self._desk_ble_device.name or self.desk_name or "Unknown",
-                max_attempts=3
+                max_attempts=3,
             )
+            controller = validated_desk.create_controller(bleak_client)
+            controller.on(DeskEventType.HEIGHT, self._async_height_notify_callback)
+            if self._disconnecting:
+                await self._async_dispose_controller(controller)
+                raise RuntimeError("Desk coordinator is disconnecting")
+            try:
+                await controller.start()
+                if self._disconnecting:
+                    raise RuntimeError("Desk coordinator is disconnecting")
+            except BaseException:
+                await self._async_dispose_controller(controller)
+                raise
 
-            bleak_client_factory: Callable[..., BLEClientProtocol] = _generate_existing_client_factory(bleak_client)
-            
-            validated_desk: ValidatedDesk = await DeskValidator(bleak_client_factory).validate_device(self._discovered_desk, timeout=BLEAK_TIMEOUT_SECONDS)
-            self._desk_variant = validated_desk.desk_config.desk_variant
-
-            bleak_client = await establish_connection(
-                BleakClientWithServiceCache,
-                self._desk_ble_device, 
-                self._desk_ble_device.name or self.desk_name or "Unknown",
-                max_attempts=3
-            )
-            self._desk = validated_desk.create_controller(bleak_client)
-            self._desk.on(DeskEventType.HEIGHT, self._async_height_notify_callback)
-
-        return self._desk
+            self._desk = controller
+            return controller
 
     @property
     def desk_name(self):
@@ -153,50 +218,31 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         return self._desk_variant in _EXTENDED_PRESET_VARIANTS
 
     async def async_connect(self):
-        await (await self._get_desk_controller()).start()
+        await self._get_desk_controller()
 
     async def async_disconnect(self) -> None:
         """Disconnect an existing controller without establishing a new one."""
-        controller = self._desk
-        self._desk = None
-        if controller is None:
-            return
-
-        client = getattr(controller, "client", None)
-        try:
-            await controller.stop()
-        except Exception:
-            _LOGGER.debug(
-                "Error stopping desk controller during unload for %s",
-                self.desk_info,
-                exc_info=True,
-            )
-        finally:
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    _LOGGER.debug(
-                        "Error disconnecting BLE client during unload for %s",
-                        self.desk_info,
-                        exc_info=True,
-                    )
-                finally:
-                    if getattr(controller, "client", None) is client:
-                        controller.client = None
+        self._disconnecting = True
+        async with self._desk_lock:
+            controller = self._desk
+            self._desk = None
+            if controller is not None:
+                await self._async_dispose_controller(controller)
 
     async def async_read_desk_height(self):
-        await (await self._get_desk_controller()).request_height_limits()
-        self.height_mm = (await self._get_desk_controller()).height_mm
+        controller = await self._get_desk_controller()
+        await controller.request_height_limits()
+        self.height_mm = controller.height_mm
         return self.height_mm
 
     async def async_read_desk_units(self):
-        await (await self._get_desk_controller()).request_units()
-        retrieved_unit = (await self._get_desk_controller()).unit
+        controller = await self._get_desk_controller()
+        await controller.request_units()
+        retrieved_unit = controller.unit
         if retrieved_unit is None:
             _LOGGER.warning("Could not retrieve units from desk, defaulting to centimeters")
             retrieved_unit = DeskUnit.CENTIMETERS
-            (await self._get_desk_controller())._unit = DeskUnit.CENTIMETERS
+            controller._unit = DeskUnit.CENTIMETERS
         self.keypad_display_units = retrieved_unit
         return self.keypad_display_units
 
