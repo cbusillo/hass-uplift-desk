@@ -2,53 +2,51 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-import re
-from typing import Any
 
-import voluptuous as vol
-
-from uplift_ble.desk_enums import DeskUnit
+from uplift_ble.desk_controller import DeskController
 from uplift_ble.desk_validator import DeskValidator
+
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
+from homeassistant.core import callback
+from .const import (
+    DOMAIN,
+    BLEAK_TIMEOUT_SECONDS,
+    CONF_FALLBACK_UNIT,
+    FALLBACK_UNIT_NONE,
+)
+from uplift_ble.desk_enums import DeskUnit
+from .models import DiscoveredDesk
+
+from typing import Any
 
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import (
-    ConfigEntry,
-    ConfigFlow,
-    ConfigFlowResult,
-    OptionsFlow,
-)
-from homeassistant.core import callback
+
+import re
+import voluptuous as vol
+
 from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
     selector,
 )
-
-from .const import (
-    BLEAK_TIMEOUT_SECONDS,
-    CONF_FALLBACK_UNIT,
-    DOMAIN,
-    FALLBACK_UNIT_NONE,
-)
-from .models import DiscoveredDesk
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-
-
 @dataclass
 class _ManualBLEDevice:
     """BLEDeviceProtocol-compatible stub for manual entry."""
-
     address: str
     name: str | None = None
-
-
 def _validate_mac_address(value: str) -> str:
     """Validate a MAC address string.
 
@@ -69,8 +67,6 @@ def _validate_mac_address(value: str) -> str:
         return ":".join(value[i : i + 2] for i in range(0, 12, 2))
 
     raise vol.Invalid(f"invalid mac address: {value}")
-
-
 class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
     """Uplift Desk config flow."""
     # The schema version of the entries that it creates
@@ -90,11 +86,9 @@ class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(
-        config_entry: ConfigEntry,
-    ) -> UpliftDeskOptionsFlow:
+    def async_get_options_flow(config_entry: ConfigEntry) -> UpliftDeskOptionsFlow:
         """Return the options flow handler."""
-        return UpliftDeskOptionsFlow(config_entry)
+        return UpliftDeskOptionsFlow()
 
     async def async_step_bluetooth(self, discovery_info: BluetoothServiceInfoBleak) -> ConfigFlowResult:
         """Handle a flow initialized by Bluetooth discovery."""
@@ -372,29 +366,26 @@ class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-class UpliftDeskOptionsFlow(OptionsFlow):
-    """Handle Uplift Desk options."""
-
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        """Initialize the options flow."""
-        self._config_entry = config_entry
+class UpliftDeskOptionsFlow(OptionsFlowWithReload):
+    """Configure height interpretation when the desk does not report units."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the fallback height unit."""
+        """Show and save the fallback height unit."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
-        current_unit = self._config_entry.options.get(
-            CONF_FALLBACK_UNIT, FALLBACK_UNIT_NONE
-        )
+            return self.async_create_entry(
+                title="", data={**self.config_entry.options, **user_input}
+            )
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
                     vol.Required(
-                        CONF_FALLBACK_UNIT, default=current_unit
+                        CONF_FALLBACK_UNIT,
+                        default=self.config_entry.options.get(
+                            CONF_FALLBACK_UNIT, FALLBACK_UNIT_NONE
+                        ),
                     ): SelectSelector(
                         SelectSelectorConfig(
                             options=[
@@ -405,7 +396,7 @@ class UpliftDeskOptionsFlow(OptionsFlow):
                             mode=SelectSelectorMode.DROPDOWN,
                             translation_key="fallback_unit",
                         )
-                    )
+                    ),
                 }
             ),
         )

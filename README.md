@@ -65,6 +65,8 @@ This integration relies on the uplift-ble Python package, which can be found on 
 
 > Note: When using this project, no other device can be connected to the desk or it will be undiscoverable. This means that the Uplift Desk app needs to be either disconnected or closed for this application to work.
 
+> Normally, an advanced keypad with programmable buttons is required to use this integration (to set the presets the integration exposes). However, for users without an advanced keypad, the desk can still be programmed with preset values using the cli provided by the [uplift-ble](https://github.com/librick/uplift-ble) to set the preset values. 
+
 The integration currently provides 5 entities:
 1. A sensor for the current height of the desk. This will update automatically as your desk is moving, though it is not instantaneous and should not be relied on for safety.
 2. A button to move the desk to its configured preset 1.
@@ -86,14 +88,17 @@ This is the easiest way to install HASS Uplift Desk. Click the button below to g
 
 ### Fallback Height Unit
 
-Most desks report the unit associated with each height value. If a desk does
-not, open the integration's configuration options and select a fallback of
-centimeters or inches. The fallback is used only for height values that arrive
-without a reported unit; choose no fallback to leave those values unknown
-instead of guessing.
+Most desks report their display units. If a desk does not, open the
+integration's configuration options and select a fallback of centimeters or
+inches matching the desk's keypad setting. Choose no fallback to leave height
+unknown until the desk reports its units. A unit reported by the desk always
+takes precedence over the fallback. Saving a changed option reloads the
+integration to apply it.
 
 Existing entries retain the previous centimeters behavior during upgrade. If
 the desk keypad displays inches, change the fallback option after upgrading.
+New entries start with no fallback. Changing this option does not change the
+keypad's units or move the desk.
 
 
 <!-- CONTRIBUTING -->
