@@ -3,7 +3,9 @@
 from __future__ import annotations
 import logging
 
-from .const import DOMAIN
+from .const import CONF_FALLBACK_UNIT, DOMAIN
+
+from uplift_ble.desk_enums import DeskUnit
 
 from bleak import BleakError
 
@@ -58,6 +60,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: Uplift_Desk_DeskConfigEn
     await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
 
     return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: Uplift_Desk_DeskConfigEntry) -> bool:
+    """Preserve the previous centimeters fallback for existing entries."""
+    if entry.version > 1:
+        return False
+    if entry.version == 1 and entry.minor_version < 2:
+        options = dict(entry.options)
+        options.setdefault(CONF_FALLBACK_UNIT, DeskUnit.CENTIMETERS.value)
+        hass.config_entries.async_update_entry(entry, options=options, minor_version=2)
+    return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: Uplift_Desk_DeskConfigEntry) -> bool:
     """Unload a config entry."""
