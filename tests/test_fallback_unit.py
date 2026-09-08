@@ -67,9 +67,12 @@ async def test_future_major_migration_is_rejected(hass):
 
 
 @pytest.mark.parametrize("selection", ["none", "centimeters", "inches"])
-async def test_options_manager_saves_and_reloads(hass, selection):
+async def test_options_manager_saves_and_reloads(hass, fake_ble, selection):
     initial = "inches" if selection != "inches" else "none"
     entry = make_entry(hass, options={CONF_FALLBACK_UNIT: initial, "other": True})
+    fake_ble.queue_client(fake_ble.valid_client())
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
     with patch.object(hass.config_entries, "async_reload", AsyncMock(return_value=True)) as reload:
         result = await hass.config_entries.options.async_init(entry.entry_id)
         assert result["type"] is FlowResultType.FORM
@@ -83,10 +86,14 @@ async def test_options_manager_saves_and_reloads(hass, selection):
         assert result["type"] is FlowResultType.CREATE_ENTRY
         assert entry.options == {CONF_FALLBACK_UNIT: selection, "other": True}
         reload.assert_awaited_once_with(entry.entry_id)
+    await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_unchanged_options_do_not_reload(hass):
+async def test_unchanged_options_do_not_reload(hass, fake_ble):
     entry = make_entry(hass, options={CONF_FALLBACK_UNIT: "centimeters"})
+    fake_ble.queue_client(fake_ble.valid_client())
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
     with patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload:
         result = await hass.config_entries.options.async_init(entry.entry_id)
         await hass.config_entries.options.async_configure(
@@ -94,6 +101,7 @@ async def test_unchanged_options_do_not_reload(hass):
         )
         await hass.async_block_till_done()
         reload.assert_not_awaited()
+    await hass.config_entries.async_unload(entry.entry_id)
 
 
 @pytest.mark.parametrize("fallback", [None, "none", "centimeters", "inches", "invalid"])

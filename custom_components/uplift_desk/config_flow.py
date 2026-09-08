@@ -11,7 +11,7 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
-    OptionsFlowWithReload,
+    OptionsFlow,
 )
 from homeassistant.core import callback
 from .const import (
@@ -88,7 +88,7 @@ class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> UpliftDeskOptionsFlow:
         """Return the options flow handler."""
-        return UpliftDeskOptionsFlow()
+        return UpliftDeskOptionsFlow(config_entry)
 
     async def async_step_bluetooth(self, discovery_info: BluetoothServiceInfoBleak) -> ConfigFlowResult:
         """Handle a flow initialized by Bluetooth discovery."""
@@ -366,8 +366,12 @@ class UpliftDeskConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-class UpliftDeskOptionsFlow(OptionsFlowWithReload):
+class UpliftDeskOptionsFlow(OptionsFlow):
     """Configure height interpretation when the desk does not report units."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Retain the entry for Home Assistant versions without config_entry."""
+        self._config_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -375,7 +379,7 @@ class UpliftDeskOptionsFlow(OptionsFlowWithReload):
         """Show and save the fallback height unit."""
         if user_input is not None:
             return self.async_create_entry(
-                title="", data={**self.config_entry.options, **user_input}
+                title="", data={**self._config_entry.options, **user_input}
             )
         return self.async_show_form(
             step_id="init",
@@ -383,7 +387,7 @@ class UpliftDeskOptionsFlow(OptionsFlowWithReload):
                 {
                     vol.Required(
                         CONF_FALLBACK_UNIT,
-                        default=self.config_entry.options.get(
+                        default=self._config_entry.options.get(
                             CONF_FALLBACK_UNIT, FALLBACK_UNIT_NONE
                         ),
                     ): SelectSelector(
