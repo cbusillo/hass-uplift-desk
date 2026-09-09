@@ -68,6 +68,7 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         self._discovered_desk = DiscoveredDesk(name=config_entry.title, address=desk_ble_device.address)
         self._desk_ble_device = desk_ble_device
         self._desk = None
+        self._desk_lock = asyncio.Lock()
         self._fallback_unit = _parse_fallback_unit(
             config_entry.options.get(CONF_FALLBACK_UNIT)
         )
@@ -182,6 +183,10 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         if old is None:
             return
 
+        await self._stop_controller(old)
+
+    async def _stop_controller(self, old: DeskController) -> None:
+        """Release a controller, including one that was never published."""
         client = old.client
         try:
             await old.stop()
@@ -201,6 +206,15 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
                     )
 
     async def _establish_and_start(self, refresh_state: bool = True) -> DeskController:
+        """Serialize connection cycles and reuse a controller another caller started."""
+        async with self._desk_lock:
+            if self._intentional_disconnect:
+                raise RuntimeError("Desk coordinator is disconnecting")
+            if self.is_connected:
+                return self._desk
+            return await self._establish_and_start_locked(refresh_state)
+
+    async def _establish_and_start_locked(self, refresh_state: bool) -> DeskController:
         """Run one (re)connect cycle: connect once, validate, start, refresh.
 
         Opens exactly one BLE connection per attempt, validates the connected
@@ -211,8 +225,10 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         adopted (because start() failed or the cycle was cancelled) is released
         so no BlueZ connection slot is leaked.
         """
-        self._intentional_disconnect = False
+        await self._stop_current_controller()
         for attempt in (1, 2):
+            if self._intentional_disconnect:
+                raise RuntimeError("Desk coordinator is disconnecting")
             device = self._resolve_ble_device()
             _LOGGER.debug("Starting (re)connect cycle for %s (attempt %d/2)", self.desk_info, attempt)
             client = await establish_connection(
@@ -222,13 +238,15 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
                 disconnected_callback=self._on_ble_disconnected,
                 max_attempts=3,
             )
-            desk_config = self._validate_client_services(client)
-            if desk_config is None:
-                _LOGGER.warning("Incomplete GATT services (attempt %d/2); clearing cache and retrying", attempt)
-                await self._clear_cache_and_discard(client)
-                continue  # a second invalid client falls through to the error below
+            controller = None
             try:
-                await self._stop_current_controller()
+                if self._intentional_disconnect:
+                    raise RuntimeError("Desk coordinator is disconnecting")
+                desk_config = self._validate_client_services(client)
+                if desk_config is None:
+                    _LOGGER.warning("Incomplete GATT services (attempt %d/2); clearing cache and retrying", attempt)
+                    await self._clear_cache_and_discard(client)
+                    continue  # a second invalid client falls through to the error below
                 controller = ValidatedDesk(
                     address=self.desk_address,
                     name=self.desk_name,
@@ -236,39 +254,50 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
                 ).create_controller(client, fallback_unit=self._fallback_unit)
                 controller.on(DeskEventType.HEIGHT, self._async_height_notify_callback)
                 await controller.start()  # EXACTLY ONCE, on the fresh controller
+                if self._intentional_disconnect:
+                    raise RuntimeError("Desk coordinator is disconnecting")
                 self._desk = controller
             except BaseException:
                 # The client was connected but never adopted (start() raised, or
                 # the cycle was cancelled mid-flight). Release it so we don't
                 # leak a BlueZ connection slot.
-                try:
-                    await client.disconnect()
-                except Exception:
-                    _LOGGER.debug("Could not disconnect unadopted client (best-effort)", exc_info=True)
+                if controller is not None:
+                    await self._stop_controller(controller)
+                else:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        _LOGGER.debug("Could not disconnect unadopted client (best-effort)", exc_info=True)
                 raise
             self._desk_variant = desk_config.desk_variant
             _LOGGER.debug("Started notifications for %s", self.desk_info)
             if refresh_state:
-                await self._refresh_state()
+                await self._refresh_state(controller)
+            if self._intentional_disconnect:
+                raise RuntimeError("Desk coordinator is disconnecting")
             return controller
         raise UpliftDeskServicesError(
             f"Connected client for {self.desk_address} still lacks required GATT characteristics after cache clear and one retry"
         )
 
-    async def _refresh_state(self) -> None:
+    async def _refresh_state(self, controller: DeskController) -> None:
         """Best-effort refresh of units + height after a (re)connect; never fails the connect."""
+        # Stay on this controller: public getters could reconnect and re-enter
+        # the lifecycle lock if the link drops during the refresh.
         try:
-            await self.async_read_desk_units()
+            await self._read_desk_units(controller)
         except Exception:
             _LOGGER.warning("Failed to refresh desk units after (re)connect", exc_info=True)
         try:
-            await self.async_read_desk_height()
+            await self._read_desk_height(controller)
         except Exception:
             _LOGGER.warning("Failed to refresh desk height after (re)connect", exc_info=True)
         self.async_set_updated_data(self._desk)
 
     async def _get_or_establish_controller(self) -> DeskController:
         """Return the live controller, running the (re)connect cycle if needed."""
+        if self._intentional_disconnect:
+            raise RuntimeError("Desk coordinator is disconnecting")
         if self._desk is not None and self.is_connected:
             return self._desk
         return await self._establish_and_start()
@@ -280,15 +309,19 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         if self._desk is None or self._desk.client is not client:
             return
         _LOGGER.warning("Desk connection lost; will attempt to reconnect")
-        self.hass.async_create_task(self._async_handle_unexpected_disconnect())
+        self.hass.async_create_task(self._async_handle_unexpected_disconnect(client))
 
-    async def _async_handle_unexpected_disconnect(self) -> None:
+    async def _async_handle_unexpected_disconnect(self, client) -> None:
         """Handle an unexpected link drop: tear down, then reconnect with backoff."""
-        await self._stop_current_controller()
-        # With self._desk now None, is_connected is False; push the update so
-        # entities (sensor + buttons) immediately report unavailable.
-        self.async_update_listeners()
-        self._start_reconnect_loop()
+        async with self._desk_lock:
+            if self._intentional_disconnect:
+                return
+            if self._desk is None or self._desk.client is not client:
+                return
+            await self._stop_current_controller()
+            # With self._desk now None, push unavailability to the entities.
+            self.async_update_listeners()
+            self._start_reconnect_loop()
 
     def _start_reconnect_loop(self) -> None:
         """Start the tracked reconnect task if one is not already running."""
@@ -360,16 +393,23 @@ class UpliftDeskBluetoothCoordinator(DataUpdateCoordinator):
         finally:
             self._intentional_disconnect = True
             self._reconnect_task = None
-            await self._stop_current_controller()
+            async with self._desk_lock:
+                await self._stop_current_controller()
 
     async def async_read_desk_height(self):
         controller = await self._get_or_establish_controller()
+        return await self._read_desk_height(controller)
+
+    async def _read_desk_height(self, controller: DeskController):
         await controller.request_height_limits()
         self.height_mm = controller.height_mm
         return self.height_mm
 
     async def async_read_desk_units(self):
         controller = await self._get_or_establish_controller()
+        return await self._read_desk_units(controller)
+
+    async def _read_desk_units(self, controller: DeskController):
         await controller.request_units()
         retrieved_unit = controller.unit
         if retrieved_unit is None:
